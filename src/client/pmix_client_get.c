@@ -10,6 +10,7 @@
  * Copyright (c) 2016-2022 IBM Corporation.  All rights reserved.
  * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * Copyright (c) 2023      Triad National Security, LLC. All rights reserved.
+ * Copyright (c) 2026      Barcelona Supercomputing Center (BSC-CNS). All Rights Reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -66,7 +67,8 @@
 
 static pmix_buffer_t *_pack_get(pmix_cb_t *cb,
                                 pmix_rank_t rank,
-                                pmix_cmd_t cmd);
+                                pmix_cmd_t cmd,
+                                bool havejob);
 
 static void get_data(int sd, short args, void *cbdata);
 
@@ -847,13 +849,38 @@ static void _value_cbfunc(pmix_status_t status, pmix_value_t *kv, void *cbdata)
     PMIX_WAKEUP_THREAD(&cb->lock);
 }
 
+/* do we already hold this namespace's job-level data? Same lookup as
+ * job_size() in pmix_client_convert.c */
+static bool have_job_data(const char *nspace)
+{
+    pmix_cb_t cb;
+    pmix_proc_t wild;
+    pmix_status_t rc;
+
+    PMIX_LOAD_PROCID(&wild, nspace, PMIX_RANK_WILDCARD);
+    PMIX_CONSTRUCT(&cb, pmix_cb_t);
+    cb.proc = &wild;
+    cb.key = PMIX_JOB_SIZE;
+    PMIX_GDS_FETCH_KV(rc, pmix_client_globals.myserver, &cb);
+    if (PMIX_SUCCESS != rc &&
+        !PMIX_GDS_CHECK_COMPONENT(pmix_client_globals.myserver, "hash")) {
+        DRAIN_KVS(&cb);
+        PMIX_GDS_FETCH_KV(rc, pmix_globals.mypeer, &cb);
+    }
+    PMIX_DESTRUCT(&cb);
+    return (PMIX_SUCCESS == rc);
+}
+
 static pmix_buffer_t *_pack_get(pmix_cb_t *cb,
                                 pmix_rank_t rank,
-                                pmix_cmd_t cmd)
+                                pmix_cmd_t cmd,
+                                bool havejob)
 {
     pmix_buffer_t *msg;
     pmix_status_t rc;
     char *nspace = cb->proc->nspace;
+    pmix_info_t *info = cb->info;
+    size_t ninfo = cb->ninfo;
 
     /* nope - see if we can get it */
     msg = PMIX_NEW(pmix_buffer_t);
@@ -883,20 +910,31 @@ static pmix_buffer_t *_pack_get(pmix_cb_t *cb,
         PMIX_RELEASE(msg);
         return NULL;
     }
+    if (havejob) {
+        // one array: the server unpacks the directives as one
+        info = (pmix_info_t *) malloc((ninfo + 1) * sizeof(pmix_info_t));
+        if (PMIX_UNLIKELY(NULL == info)) {
+            PMIX_RELEASE(msg);
+            return NULL;
+        }
+        if (0 < ninfo) {
+            memcpy(info, cb->info, ninfo * sizeof(pmix_info_t));
+        }
+        PMIX_INFO_LOAD(&info[ninfo], PMIX_GET_HAVE_JOB_DATA, NULL, PMIX_BOOL);
+        ++ninfo;
+    }
     /* pack the number of info structs */
-    PMIX_BFROPS_PACK(rc, pmix_client_globals.myserver, msg, &cb->ninfo, 1, PMIX_SIZE);
+    PMIX_BFROPS_PACK(rc, pmix_client_globals.myserver, msg, &ninfo, 1, PMIX_SIZE);
+    if (PMIX_SUCCESS == rc && 0 < ninfo) {
+        PMIX_BFROPS_PACK(rc, pmix_client_globals.myserver, msg, info, ninfo, PMIX_INFO);
+    }
+    if (havejob) {
+        free(info);
+    }
     if (PMIX_UNLIKELY(PMIX_SUCCESS != rc)) {
         PMIX_ERROR_LOG(rc);
         PMIX_RELEASE(msg);
         return NULL;
-    }
-    if (0 < cb->ninfo) {
-        PMIX_BFROPS_PACK(rc, pmix_client_globals.myserver, msg, cb->info, cb->ninfo, PMIX_INFO);
-        if (PMIX_UNLIKELY(PMIX_SUCCESS != rc)) {
-            PMIX_ERROR_LOG(rc);
-            PMIX_RELEASE(msg);
-            return NULL;
-        }
     }
     if (NULL != cb->key) {
         /* pack the key */
@@ -1857,7 +1895,10 @@ doget:
     }
 
     /* we don't have a pending request, so let's create one */
-    msg = _pack_get(cb, proc.rank, PMIX_GETNB_CMD);
+    msg = _pack_get(cb, proc.rank, PMIX_GETNB_CMD,
+                    PMIX_RANK_WILDCARD != proc.rank &&
+                    !PMIX_CHECK_NSPACE(proc.nspace, pmix_globals.myid.nspace) &&
+                    have_job_data(proc.nspace));
     if (PMIX_UNLIKELY(NULL == msg)) {
         cb->status = PMIX_ERROR;
         PMIX_ERROR_LOG(cb->status);

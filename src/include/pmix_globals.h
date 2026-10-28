@@ -71,6 +71,9 @@ BEGIN_C_DECLS
 #define PMIX_PNET_SETUP_APP \
     "pmix.pnet.setapp" // (pmix_byte_object_t) blob containing info to be given to
                        //      pnet framework on remote nodes
+#define PMIX_GET_HAVE_JOB_DATA \
+    "pmix.get.havejob" // (bool) the requester of a get already holds the
+                       //      target namespace's job-level data
 
 // define some bit handling macros
 #define PMIX_SET_BIT(a, f) \

@@ -10,6 +10,7 @@
  * Copyright (c) 2016      IBM Corporation.  All rights reserved.
  * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * Copyright (c) 2024      Triad National Security, LLC. All rights reserved.
+ * Copyright (c) 2026      Barcelona Supercomputing Center (BSC-CNS). All Rights Reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -92,8 +93,11 @@ PMIX_CLASS_INSTANCE(pmix_dmdx_reply_caddy_t, pmix_object_t, dcd_con, NULL);
 
 static void dmdx_cbfunc(pmix_status_t status, const char *data, size_t ndata, void *cbdata,
                         pmix_release_cbfunc_t relfn, void *relcbdata);
+static bool requester_has_job_data(const pmix_server_caddy_t *cd);
+
 static pmix_status_t _satisfy_request(pmix_namespace_t *nptr, pmix_rank_t rank, char *key,
-                                      pmix_server_caddy_t *cd, bool diffnspace, pmix_scope_t scope,
+                                      pmix_server_caddy_t *cd, bool diffnspace, bool jobdata,
+                                      pmix_scope_t scope,
                                       pmix_modex_cbfunc_t cbfunc, void *cbdata);
 static pmix_status_t create_local_tracker(char nspace[], pmix_rank_t rank, char *key,
                                           const pmix_peer_t *peer,
@@ -797,7 +801,8 @@ pmix_status_t pmix_server_get(pmix_buffer_t *buf, pmix_modex_cbfunc_t cbfunc, vo
     }
 
     /* since everyone has registered, see if we already have this data */
-    rc = _satisfy_request(nptr, rank, key, cd, diffnspace, scope, cbfunc, cbdata);
+    rc = _satisfy_request(nptr, rank, key, cd, diffnspace,
+                          diffnspace && !requester_has_job_data(cd), scope, cbfunc, cbdata);
     if (PMIX_SUCCESS == rc) {
         /* return success as the satisfy_request function
          * calls the cbfunc for us, and it will have
@@ -1196,8 +1201,22 @@ static bool list_has_key(pmix_list_t *kvs, const char *key)
     return false;
 }
 
+/* Did the requester say it already holds the target's job-level data? */
+static bool requester_has_job_data(const pmix_server_caddy_t *cd)
+{
+    size_t n;
+
+    for (n = 0; n < cd->ninfo; n++) {
+        if (PMIX_CHECK_KEY(&cd->info[n], PMIX_GET_HAVE_JOB_DATA)) {
+            return PMIX_INFO_TRUE(&cd->info[n]);
+        }
+    }
+    return false;
+}
+
 static pmix_status_t _satisfy_request(pmix_namespace_t *nptr, pmix_rank_t rank, char *key,
-                                      pmix_server_caddy_t *cd, bool diffnspace, pmix_scope_t scope,
+                                      pmix_server_caddy_t *cd, bool diffnspace, bool jobdata,
+                                      pmix_scope_t scope,
                                       pmix_modex_cbfunc_t cbfunc, void *cbdata)
 {
     pmix_status_t rc;
@@ -1211,17 +1230,17 @@ static pmix_status_t _satisfy_request(pmix_namespace_t *nptr, pmix_rank_t rank, 
     size_t sz = 0;
 
     pmix_output_verbose(2, pmix_server_globals.get_output,
-                        "%s:%d SATISFY REQUEST CALLED FOR %s:%d ON SCOPE %s KEY %s",
+                        "%s:%d SATISFY REQUEST CALLED FOR %s:%d ON SCOPE %s KEY %s JOBDATA %s",
                         pmix_globals.myid.nspace, pmix_globals.myid.rank,
                         nptr->nspace, rank, PMIx_Scope_string(scope),
-                        (NULL == key) ? "NULL" : key);
+                        (NULL == key) ? "NULL" : key, jobdata ? "yes" : "no");
 
     PMIX_CONSTRUCT(&pbkt, pmix_buffer_t);
     PMIX_LOAD_NSPACE(proc.nspace, nptr->nspace);
 
-    /* if the rank is WILDCARD or the target is in an nspace different
-     * from the requester, include a copy of the job-level data */
-    if (PMIX_RANK_WILDCARD == rank || diffnspace) {
+    /* if the rank is WILDCARD, or the target is in an nspace different
+     * from the requester and it lacks that job's data, include a copy */
+    if (PMIX_RANK_WILDCARD == rank || jobdata) {
         rc = get_job_data(nptr->nspace, cd, NULL, &pbkt);
         if (PMIX_SUCCESS != rc) {
             PMIX_DESTRUCT(&pbkt);
@@ -1448,7 +1467,7 @@ static void check_req(pmix_namespace_t *nptr,
             } else {
                 key = NULL;
             }
-            rc = _satisfy_request(nptr, rank, key, &scd, diffnspace, scope,
+            rc = _satisfy_request(nptr, rank, key, &scd, diffnspace, diffnspace, scope,
                                   req->cbfunc, req->cbdata);
             if (PMIX_SUCCESS != rc && NULL != req->cbfunc) {
                 /* if we can't satisfy this particular request (missing key?).
